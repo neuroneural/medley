@@ -1,0 +1,178 @@
+--- /mnt/data/medley_worker(1).sh	2026-07-30 02:19:16.022666886 +0000
++++ /mnt/data/medley_worker_fixed.sh	2026-07-30 02:20:46.546666886 +0000
+@@ -218,6 +218,62 @@
+     exit 5
+   fi
+ }
++
++setup_fsl() {
++  local fsl_module="${FSL_MODULE:-fsl}"
++
++  # Make `module` available in non-login batch shells.
++  if ! command -v module >/dev/null 2>&1; then
++    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash \
++                 /usr/share/lmod/lmod/init/bash /opt/apps/lmod/lmod/init/bash; do
++      [[ -r "$_init" ]] && { set +u; source "$_init"; set -u; break; }
++    done
++  fi
++
++  # Prefer the cluster module, but allow an already configured FSL install.
++  if ! command -v flirt >/dev/null 2>&1; then
++    if command -v module >/dev/null 2>&1; then
++      set +u
++      module load "$fsl_module"
++      set -u
++      hash -r
++    fi
++  fi
++
++  command -v flirt >/dev/null 2>&1 || {
++    echo "ERROR: flirt was not found. Set FSL_MODULE in config/site.env or configure FSL in PATH." >&2
++    exit 5
++  }
++
++  echo "FSL module=$fsl_module"
++  echo "FSLDIR=${FSLDIR:-not-set}"
++  echo "flirt=$(command -v flirt)"
++}
++
++flirt_label_to_reference() {
++  local moving="${1:?moving label required}"
++  local reference="${2:?reference image required}"
++  local output="${3:?output image required}"
++
++  [[ -f "$moving" ]] || {
++    echo "Missing FLIRT input: $moving" >&2
++    exit 4
++  }
++  [[ -f "$reference" ]] || {
++    echo "Missing FLIRT reference: $reference" >&2
++    exit 4
++  }
++
++  run_if_needed "$output" \
++    flirt \
++      -in "$moving" \
++      -ref "$reference" \
++      -applyxfm \
++      -usesqform \
++      -interp nearestneighbour \
++      -out "$output"
++}
++
+ setup_simnibs() {
+   # Preferred path: an explicit activation script (reproducible, version-pinned).
+   # Fallback: a site 'module load simnibs' when no script is configured.
+@@ -475,7 +531,22 @@
+     ;;
+ 
+   postprocess)
++    # FreeSurfer tools are still needed to return aseg.mgz from conformed
++    # FreeSurfer space to the input-image geometry before FLIRT harmonization.
+     setup_freesurfer runtime
++
++    # Use the original FSL/FLIRT label postprocessing method.
++    setup_fsl
++
++    native_ref="$work_dir/T1_enhanced-18.nii.gz"
++    [[ -f "$native_ref" ]] || {
++      echo "Missing FLIRT reference: $native_ref" >&2
++      exit 4
++    }
++
++    # SynthSeg candidates were generated on enlarged images. Undo the
++    # enlargement first, then harmonize each label map to the native enhanced
++    # T1 grid with the original nearest-neighbor FLIRT command.
+     declare -a pairs=(
+       "oT1e_ss1rr.nii.gz:oT1e_ss1rr1.nii.gz:oT1e-ss1rrf.nii.gz"
+       "T1_ss1rr.nii.gz:T1_ss1rr1.nii.gz:T1-ss1rrf.nii.gz"
+@@ -487,23 +558,26 @@
+       "$python_exe" "$code_dir/scale_nifti.py" \
+         "$work_dir/$src" "$work_dir/$restored" \
+         --scale "$inverse_scale" --order 0 "${ow[@]}"
+-      "$python_exe" "$code_dir/resample_labels.py" \
+-        "$work_dir/$restored" "$work_dir/T1.nii.gz" "$work_dir/$aligned" "${ow[@]}"
++      flirt_label_to_reference \
++        "$work_dir/$restored" \
++        "$native_ref" \
++        "$work_dir/$aligned"
+     done
+ 
+-    # FreeSurfer on enhanced-only T1: return from conformed space directly
+-    # to the native enhanced grid, which has the same geometry as T1.nii.gz.
++    # FreeSurfer enhanced-only branch:
++    #   aseg.mgz -> rawavg/input geometry -> FLIRT native enhanced grid.
+     run_if_needed "$work_dir/aseg_enhanced_native.nii.gz" \
+       mri_vol2vol --mov "$work_dir/fs_enhanced_aseg.mgz" \
+         --targ "$work_dir/fs_enhanced_rawavg.mgz" \
+         --regheader --o "$work_dir/aseg_enhanced_native.nii.gz" \
+         --no-save-reg --interp nearest
+-    "$python_exe" "$code_dir/resample_labels.py" \
+-      "$work_dir/aseg_enhanced_native.nii.gz" "$work_dir/T1.nii.gz" \
+-      "$work_dir/aseg_enhanced1r.nii.gz" "${ow[@]}"
++    flirt_label_to_reference \
++      "$work_dir/aseg_enhanced_native.nii.gz" \
++      "$native_ref" \
++      "$work_dir/aseg_enhanced1r.nii.gz"
+ 
+-    # FreeSurfer on enhanced+enlarged T1: return to the enlarged native grid,
+-    # undo the age-specific enlargement, then align to the original T1 grid.
++    # FreeSurfer enhanced+enlarged branch:
++    #   aseg.mgz -> enlarged input geometry -> undo enlargement -> FLIRT.
+     run_if_needed "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
+       mri_vol2vol --mov "$work_dir/fs_enlarged_aseg.mgz" \
+         --targ "$work_dir/fs_enlarged_rawavg.mgz" \
+@@ -513,25 +587,41 @@
+       "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
+       "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" \
+       --scale "$inverse_scale" --order 0 "${ow[@]}"
+-    "$python_exe" "$code_dir/resample_labels.py" \
+-      "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" "$work_dir/T1.nii.gz" \
+-      "$work_dir/aseg_enhanced_enlarged1r.nii.gz" "${ow[@]}"
++    flirt_label_to_reference \
++      "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" \
++      "$native_ref" \
++      "$work_dir/aseg_enhanced_enlarged1r.nii.gz"
+ 
++    # CHARM also runs on the enlarged enhanced image. First place its labels on
++    # that enlarged input grid, undo enlargement, then use FLIRT for the final
++    # native-grid harmonization.
+     if [[ "$use_charm" == "1" ]]; then
+-      "$python_exe" "$code_dir/resample_labels.py" \
+-        "$work_dir/charm_label_source.nii.gz" "$work_dir/$charm_input_name" \
+-        "$work_dir/charm_label_enlarged_grid.nii.gz" "${ow[@]}"
++      flirt_label_to_reference \
++        "$work_dir/charm_label_source.nii.gz" \
++        "$work_dir/$charm_input_name" \
++        "$work_dir/charm_label_enlarged_grid.nii.gz"
+       "$python_exe" "$code_dir/scale_nifti.py" \
+-        "$work_dir/charm_label_enlarged_grid.nii.gz" "$work_dir/charm_label_unscaled.nii.gz" \
++        "$work_dir/charm_label_enlarged_grid.nii.gz" \
++        "$work_dir/charm_label_unscaled.nii.gz" \
+         --scale "$inverse_scale" --order 0 "${ow[@]}"
+-      "$python_exe" "$code_dir/resample_labels.py" \
+-        "$work_dir/charm_label_unscaled.nii.gz" "$work_dir/T1.nii.gz" \
+-        "$work_dir/charm_label_native.nii.gz" "${ow[@]}"
++      flirt_label_to_reference \
++        "$work_dir/charm_label_unscaled.nii.gz" \
++        "$native_ref" \
++        "$work_dir/charm_label_native.nii.gz"
+     fi
+ 
+-    validate=(T1.nii.gz T1-skullstripped-tissue.nii.gz mask.nii.gz mask-csf.nii.gz T1-ss1rrf.nii.gz aseg_enhanced1r.nii.gz aseg_enhanced_enlarged1r.nii.gz)
++    validate=(
++      T1.nii.gz
++      T1-skullstripped-tissue.nii.gz
++      mask.nii.gz
++      mask-csf.nii.gz
++      T1-ss1rrf.nii.gz
++      aseg_enhanced1r.nii.gz
++      aseg_enhanced_enlarged1r.nii.gz
++    )
+     [[ "$use_charm" == "1" ]] && validate+=(charm_label_native.nii.gz)
+-    "$python_exe" "$code_dir/validate_inputs.py" --subject-dir "$work_dir" --files "${validate[@]}"
++    "$python_exe" "$code_dir/validate_inputs.py" \
++      --subject-dir "$work_dir" --files "${validate[@]}"
+     ;;
+ 
+   consolidate)
