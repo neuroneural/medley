@@ -133,7 +133,7 @@ find_fs_mri_dir() {
   local explicit legacy
 
   explicit="$(fs_variant_subjects_dir "$variant")/$fs_id/mri"
-  if [[ -f "$explicit/aseg.mgz" && -f "$explicit/rawavg.mgz" ]]; then
+  if [[ -f "$explicit/aseg.mgz" ]]; then
     printf '%s\n' "$explicit"
     return 0
   fi
@@ -142,7 +142,7 @@ find_fs_mri_dir() {
   #   <fs-root>/<age>/<subject>/mri
   if [[ "$variant" == "enhanced_enlarged" ]]; then
     legacy="$fs_subjects_dir/$age_name/$fs_id/mri"
-    if [[ -f "$legacy/aseg.mgz" && -f "$legacy/rawavg.mgz" ]]; then
+    if [[ -f "$legacy/aseg.mgz" ]]; then
       printf '%s\n' "$legacy"
       return 0
     fi
@@ -165,10 +165,9 @@ setup_freesurfer() {
     done
   fi
 
-  # Clear scalar vars BEFORE loading: this modulefile uses prepend-path on
-  # FREESURFER_HOME/SUBJECTS_DIR/MNI_DIR, so a value left by a login profile
-  # (e.g. the personal freesurfer-new dev build) would concatenate into a
-  # broken colon-list. Also drops an auto-loaded dev FreeSurfer.
+  # Clear inherited FreeSurfer variables before loading the requested version.
+  # Some modulefiles use prepend-path and can create invalid colon-separated
+  # scalar values when these variables are already defined.
   unset FREESURFER_HOME FSFAST_HOME MNI_DIR SUBJECTS_DIR \
         MINC_BIN_DIR MINC_LIB_DIR MNI_DATAPATH FS_LICENSE || true
 
@@ -184,16 +183,15 @@ setup_freesurfer() {
   [[ -n "${FREESURFER_HOME:-}" ]] || export FREESURFER_HOME="$freesurfer_home"
   [[ -d "$FREESURFER_HOME" ]] || { echo "FREESURFER_HOME does not exist: $FREESURFER_HOME" >&2; exit 5; }
 
-  # The modulefile does NOT source SetUpFreeSurfer.sh nor set the MINC/mni
-  # PATH + PERL5LIB that a full `recon-all -all` needs; complete it here.
-  # SetUpFreeSurfer.sh is not errexit/nounset clean -> disable both.
+  # Source SetUpFreeSurfer.sh explicitly so required PATH, MNI, MINC, and Perl
+  # settings are available in non-login batch shells.
+  # SetUpFreeSurfer.sh is not errexit/nounset clean, so temporarily disable both.
   set +eu
   # shellcheck disable=SC1090
   source "$FREESURFER_HOME/SetUpFreeSurfer.sh"
   set -eu
 
-  # License (module does not set it) and per-variant output tree
-  # (module points SUBJECTS_DIR at $modroot/subjects; override it).
+  # Set the FreeSurfer license path and a variant-specific SUBJECTS_DIR.
   export FS_LICENSE="${FS_LICENSE:-$FREESURFER_HOME/license.txt}"
   export SUBJECTS_DIR="$(fs_variant_subjects_dir "$variant")"
   mkdir -p "$SUBJECTS_DIR"
@@ -206,7 +204,7 @@ setup_freesurfer() {
   echo "recon-all: $(command -v recon-all || true)  [$ver]"
 
   local _t
-  for _t in recon-all mri_synthseg mri_synthstrip; do
+  for _t in recon-all mri_synthseg mri_synthstrip mri_label2vol; do
     command -v "$_t" >/dev/null || { echo "$_t not found after loading $fs_module" >&2; exit 5; }
   done
 
@@ -272,6 +270,73 @@ flirt_label_to_reference() {
       -usesqform \
       -interp nearestneighbour \
       -out "$output"
+}
+
+validate_and_cast_discrete_labels() {
+  local label_file="${1:?label file required}"
+
+  [[ -f "$label_file" ]] || {
+    echo "Missing label file: $label_file" >&2
+    exit 4
+  }
+
+  # Verify that no interpolation-created fractional labels are present, then
+  # rewrite the NIfTI with an integer dtype while preserving affine/qform/sform.
+  "$python_exe" - "$label_file" <<'PYLABEL'
+import os
+import sys
+import tempfile
+
+import nibabel as nib
+import numpy as np
+
+path = sys.argv[1]
+img = nib.load(path)
+data = np.asanyarray(img.dataobj)
+
+if not np.isfinite(data).all():
+    raise SystemExit(f"ERROR: non-finite values in label map: {path}")
+
+rounded = np.rint(data)
+max_deviation = float(np.max(np.abs(data - rounded))) if data.size else 0.0
+if max_deviation > 1e-6:
+    raise SystemExit(
+        f"ERROR: non-integer values in label map {path}; "
+        f"maximum deviation from integer={max_deviation:.9g}"
+    )
+
+# int32 safely covers FreeSurfer aseg label IDs.
+integer_data = rounded.astype(np.int32, copy=False)
+header = img.header.copy()
+header.set_data_dtype(np.int32)
+
+qform, qcode = img.get_qform(coded=True)
+sform, scode = img.get_sform(coded=True)
+
+folder = os.path.dirname(os.path.abspath(path))
+fd, tmp = tempfile.mkstemp(prefix=".medley-label-", suffix=".nii.gz", dir=folder)
+os.close(fd)
+try:
+    out = nib.Nifti1Image(integer_data, img.affine, header=header)
+    if qform is not None:
+        out.set_qform(qform, int(qcode))
+    if sform is not None:
+        out.set_sform(sform, int(scode))
+    nib.save(out, tmp)
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+
+labels = np.unique(integer_data)
+if labels.size:
+    print(
+        f"Validated discrete labels: {path} "
+        f"dtype=int32 count={labels.size} range={int(labels.min())}..{int(labels.max())}"
+    )
+else:
+    print(f"Validated empty discrete label map: {path} dtype=int32")
+PYLABEL
 }
 
 setup_simnibs() {
@@ -422,8 +487,8 @@ case "$stage" in
       mri_synthseg --i "$work_dir/oT1e-18-big3.nii.gz" --o "$synthseg_dir/oT1e_ss2-1rr.nii.gz" --threads "$threads" --cpu
     run_if_needed "$synthseg_dir/T1_ss2-1rr.nii.gz" \
       mri_synthseg --i "$work_dir/T1-big3.nii.gz" --o "$synthseg_dir/T1_ss2-1rr.nii.gz" --threads "$threads" --cpu
-    # These two masks are intentionally generated on the native working grid,
-    # so babyHead does not need to inverse-scale a skull-strip mask.
+    # Generate both SynthStrip masks on the native enhanced-T1 grid so no
+    # inverse scaling is required during downstream consolidation.
     run_if_needed "$synthseg_dir/mask.nii.gz" \
       mri_synthstrip -i "$work_dir/T1_enhanced-18.nii.gz" -o "$synthseg_dir/stripped.nii.gz" -m "$synthseg_dir/mask.nii.gz" --no-csf
     run_if_needed "$synthseg_dir/mask-csf.nii.gz" \
@@ -500,25 +565,48 @@ case "$stage" in
       atomic_copy "$synthseg_dir/$name" "$work_dir/$name"
     done
 
+    # Gather every complete FreeSurfer variant available for this subject.
+    # This pipeline uses rawavg.mgz as the mri_label2vol template. orig.mgz is
+    # optional and is copied only for QC and provenance.
+    fs_available=0
+
     fs_enhanced_mri="$(find_fs_mri_dir enhanced || true)"
-    [[ -f "$fs_enhanced_mri/aseg.mgz" && -f "$fs_enhanced_mri/rawavg.mgz" ]] || {
-      echo "Missing enhanced-only FreeSurfer outputs under: $fs_enhanced_mri" >&2
-      exit 4
-    }
-    atomic_copy "$fs_enhanced_mri/aseg.mgz" "$work_dir/fs_enhanced_aseg.mgz"
-    atomic_copy "$fs_enhanced_mri/rawavg.mgz" "$work_dir/fs_enhanced_rawavg.mgz"
-    [[ -f "$fs_enhanced_mri/orig.mgz" ]] && \
-      atomic_copy "$fs_enhanced_mri/orig.mgz" "$work_dir/fs_enhanced_orig.mgz"
+    if [[ -f "$fs_enhanced_mri/aseg.mgz" && -f "$fs_enhanced_mri/rawavg.mgz" ]]; then
+      atomic_copy "$fs_enhanced_mri/aseg.mgz" "$work_dir/fs_enhanced_aseg.mgz"
+      atomic_copy "$fs_enhanced_mri/rawavg.mgz" "$work_dir/fs_enhanced_rawavg.mgz"
+      [[ -f "$fs_enhanced_mri/orig.mgz" ]] && \
+        atomic_copy "$fs_enhanced_mri/orig.mgz" "$work_dir/fs_enhanced_orig.mgz"
+      fs_available=$((fs_available + 1))
+      log "Available complete FreeSurfer variant: enhanced"
+    elif [[ -f "$work_dir/fs_enhanced_aseg.mgz" && -f "$work_dir/fs_enhanced_rawavg.mgz" ]]; then
+      fs_available=$((fs_available + 1))
+      log "Reusing already gathered complete FreeSurfer variant: enhanced"
+    else
+      log "Complete FreeSurfer variant unavailable: enhanced"
+    fi
 
     fs_enlarged_mri="$(find_fs_mri_dir enhanced_enlarged || true)"
-    [[ -f "$fs_enlarged_mri/aseg.mgz" && -f "$fs_enlarged_mri/rawavg.mgz" ]] || {
-      echo "Missing enhanced+enlarged FreeSurfer outputs under: $fs_enlarged_mri" >&2
+    if [[ -f "$fs_enlarged_mri/aseg.mgz" && -f "$fs_enlarged_mri/rawavg.mgz" ]]; then
+      atomic_copy "$fs_enlarged_mri/aseg.mgz" "$work_dir/fs_enlarged_aseg.mgz"
+      atomic_copy "$fs_enlarged_mri/rawavg.mgz" "$work_dir/fs_enlarged_rawavg.mgz"
+      [[ -f "$fs_enlarged_mri/orig.mgz" ]] && \
+        atomic_copy "$fs_enlarged_mri/orig.mgz" "$work_dir/fs_enlarged_orig.mgz"
+      fs_available=$((fs_available + 1))
+      log "Available complete FreeSurfer variant: enhanced_enlarged"
+    elif [[ -f "$work_dir/fs_enlarged_aseg.mgz" && -f "$work_dir/fs_enlarged_rawavg.mgz" ]]; then
+      fs_available=$((fs_available + 1))
+      log "Reusing already gathered complete FreeSurfer variant: enhanced_enlarged"
+    else
+      log "Complete FreeSurfer variant unavailable: enhanced_enlarged"
+    fi
+
+    if [[ "$fs_available" -lt 1 ]]; then
+      echo "No complete FreeSurfer result found for $age_name/$subject." >&2
+      echo "At least one variant must contain both aseg.mgz and rawavg.mgz:" >&2
+      echo "  enhanced:          <FS root>/enhanced/$age_name/$fs_id/mri/{aseg,rawavg}.mgz" >&2
+      echo "  enhanced_enlarged: <FS root>/enhanced_enlarged/$age_name/$fs_id/mri/{aseg,rawavg}.mgz" >&2
       exit 4
-    }
-    atomic_copy "$fs_enlarged_mri/aseg.mgz" "$work_dir/fs_enlarged_aseg.mgz"
-    atomic_copy "$fs_enlarged_mri/rawavg.mgz" "$work_dir/fs_enlarged_rawavg.mgz"
-    [[ -f "$fs_enlarged_mri/orig.mgz" ]] && \
-      atomic_copy "$fs_enlarged_mri/orig.mgz" "$work_dir/fs_enlarged_orig.mgz"
+    fi
 
     if [[ "$use_charm" == "1" ]]; then
       charm_label="$(find_charm_label || true)"
@@ -531,11 +619,10 @@ case "$stage" in
     ;;
 
   postprocess)
-    # FreeSurfer tools are still needed to return aseg.mgz from conformed
-    # FreeSurfer space to the input-image geometry before FLIRT harmonization.
+    # FreeSurfer segmentations are discrete label maps. Convert each aseg.mgz
+    # to its rawavg template grid with mri_label2vol, then apply nearest-neighbor
+    # FLIRT for final grid harmonization.
     setup_freesurfer runtime
-
-    # Use the original FSL/FLIRT label postprocessing method.
     setup_fsl
 
     native_ref="$work_dir/T1_enhanced-18.nii.gz"
@@ -562,35 +649,75 @@ case "$stage" in
         "$work_dir/$restored" \
         "$native_ref" \
         "$work_dir/$aligned"
+      validate_and_cast_discrete_labels "$work_dir/$aligned"
     done
 
-    # FreeSurfer enhanced-only branch:
-    #   aseg.mgz -> rawavg/input geometry -> FLIRT native enhanced grid.
-    run_if_needed "$work_dir/aseg_enhanced_native.nii.gz" \
-      mri_vol2vol --mov "$work_dir/fs_enhanced_aseg.mgz" \
-        --targ "$work_dir/fs_enhanced_rawavg.mgz" \
-        --regheader --o "$work_dir/aseg_enhanced_native.nii.gz" \
-        --no-save-reg --interp nearest
-    flirt_label_to_reference \
-      "$work_dir/aseg_enhanced_native.nii.gz" \
-      "$native_ref" \
-      "$work_dir/aseg_enhanced1r.nii.gz"
+    # Process whichever FreeSurfer variants were gathered. At least one must
+    # be available, but the two branches do not depend on each other.
+    fs_processed=0
 
-    # FreeSurfer enhanced+enlarged branch:
-    #   aseg.mgz -> enlarged input geometry -> undo enlargement -> FLIRT.
-    run_if_needed "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
-      mri_vol2vol --mov "$work_dir/fs_enlarged_aseg.mgz" \
-        --targ "$work_dir/fs_enlarged_rawavg.mgz" \
-        --regheader --o "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
-        --no-save-reg --interp nearest
-    "$python_exe" "$code_dir/scale_nifti.py" \
-      "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
-      "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" \
-      --scale "$inverse_scale" --order 0 "${ow[@]}"
-    flirt_label_to_reference \
-      "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" \
-      "$native_ref" \
-      "$work_dir/aseg_enhanced_enlarged1r.nii.gz"
+    if [[ -f "$work_dir/fs_enhanced_aseg.mgz" ]]; then
+      [[ -f "$work_dir/fs_enhanced_rawavg.mgz" ]] || {
+        echo "Missing enhanced FreeSurfer template: $work_dir/fs_enhanced_rawavg.mgz" >&2
+        exit 4
+      }
+
+      # Map the discrete aseg labels from FreeSurfer conformed space to the
+      # enhanced scan's rawavg template grid.
+      run_if_needed "$work_dir/aseg_enhanced_native.nii.gz" \
+        mri_label2vol \
+          --seg "$work_dir/fs_enhanced_aseg.mgz" \
+          --temp "$work_dir/fs_enhanced_rawavg.mgz" \
+          --regheader "$work_dir/fs_enhanced_aseg.mgz" \
+          --o "$work_dir/aseg_enhanced_native.nii.gz"
+      validate_and_cast_discrete_labels "$work_dir/aseg_enhanced_native.nii.gz"
+
+      flirt_label_to_reference \
+        "$work_dir/aseg_enhanced_native.nii.gz" \
+        "$native_ref" \
+        "$work_dir/aseg_enhanced1r.nii.gz"
+      validate_and_cast_discrete_labels "$work_dir/aseg_enhanced1r.nii.gz"
+
+      fs_processed=$((fs_processed + 1))
+      log "Postprocessed FreeSurfer variant: enhanced (mri_label2vol + FLIRT)"
+    fi
+
+    if [[ -f "$work_dir/fs_enlarged_aseg.mgz" ]]; then
+      [[ -f "$work_dir/fs_enlarged_rawavg.mgz" ]] || {
+        echo "Missing enhanced+enlarged FreeSurfer template: $work_dir/fs_enlarged_rawavg.mgz" >&2
+        exit 4
+      }
+
+      # Return the enlarged branch to its rawavg/input geometry, undo the
+      # age-specific enlargement, then harmonize to the native enhanced T1.
+      run_if_needed "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
+        mri_label2vol \
+          --seg "$work_dir/fs_enlarged_aseg.mgz" \
+          --temp "$work_dir/fs_enlarged_rawavg.mgz" \
+          --regheader "$work_dir/fs_enlarged_aseg.mgz" \
+          --o "$work_dir/aseg_enhanced_enlarged_native.nii.gz"
+      validate_and_cast_discrete_labels "$work_dir/aseg_enhanced_enlarged_native.nii.gz"
+
+      "$python_exe" "$code_dir/scale_nifti.py" \
+        "$work_dir/aseg_enhanced_enlarged_native.nii.gz" \
+        "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" \
+        --scale "$inverse_scale" --order 0 "${ow[@]}"
+      validate_and_cast_discrete_labels "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz"
+
+      flirt_label_to_reference \
+        "$work_dir/aseg_enhanced_enlarged_unscaled.nii.gz" \
+        "$native_ref" \
+        "$work_dir/aseg_enhanced_enlarged1r.nii.gz"
+      validate_and_cast_discrete_labels "$work_dir/aseg_enhanced_enlarged1r.nii.gz"
+
+      fs_processed=$((fs_processed + 1))
+      log "Postprocessed FreeSurfer variant: enhanced_enlarged (mri_label2vol + inverse scale + FLIRT)"
+    fi
+
+    if [[ "$fs_processed" -lt 1 ]]; then
+      echo "No gathered FreeSurfer variant is available for postprocessing: $work_dir" >&2
+      exit 4
+    fi
 
     # CHARM also runs on the enlarged enhanced image. First place its labels on
     # that enlarged input grid, undo enlargement, then use FLIRT for the final
@@ -600,14 +727,19 @@ case "$stage" in
         "$work_dir/charm_label_source.nii.gz" \
         "$work_dir/$charm_input_name" \
         "$work_dir/charm_label_enlarged_grid.nii.gz"
+      validate_and_cast_discrete_labels "$work_dir/charm_label_enlarged_grid.nii.gz"
+
       "$python_exe" "$code_dir/scale_nifti.py" \
         "$work_dir/charm_label_enlarged_grid.nii.gz" \
         "$work_dir/charm_label_unscaled.nii.gz" \
         --scale "$inverse_scale" --order 0 "${ow[@]}"
+      validate_and_cast_discrete_labels "$work_dir/charm_label_unscaled.nii.gz"
+
       flirt_label_to_reference \
         "$work_dir/charm_label_unscaled.nii.gz" \
         "$native_ref" \
         "$work_dir/charm_label_native.nii.gz"
+      validate_and_cast_discrete_labels "$work_dir/charm_label_native.nii.gz"
     fi
 
     validate=(
@@ -616,9 +748,9 @@ case "$stage" in
       mask.nii.gz
       mask-csf.nii.gz
       T1-ss1rrf.nii.gz
-      aseg_enhanced1r.nii.gz
-      aseg_enhanced_enlarged1r.nii.gz
     )
+    [[ -f "$work_dir/aseg_enhanced1r.nii.gz" ]] && validate+=(aseg_enhanced1r.nii.gz)
+    [[ -f "$work_dir/aseg_enhanced_enlarged1r.nii.gz" ]] && validate+=(aseg_enhanced_enlarged1r.nii.gz)
     [[ "$use_charm" == "1" ]] && validate+=(charm_label_native.nii.gz)
     "$python_exe" "$code_dir/validate_inputs.py" \
       --subject-dir "$work_dir" --files "${validate[@]}"
@@ -629,14 +761,32 @@ case "$stage" in
       log "Final output already exists: $work_dir/$final_name"
       exit 0
     fi
+    # FREESURFER_FINAL is a preference. When the preferred branch is absent,
+    # automatically fall back to the other completed branch for this subject.
     case "$freesurfer_final" in
       enhanced)
-        final_aseg_name="aseg_enhanced1r.nii.gz"
+        preferred_aseg_name="aseg_enhanced1r.nii.gz"
+        fallback_aseg_name="aseg_enhanced_enlarged1r.nii.gz"
+        fallback_variant="enhanced_enlarged"
         ;;
       enhanced_enlarged)
-        final_aseg_name="aseg_enhanced_enlarged1r.nii.gz"
+        preferred_aseg_name="aseg_enhanced_enlarged1r.nii.gz"
+        fallback_aseg_name="aseg_enhanced1r.nii.gz"
+        fallback_variant="enhanced"
         ;;
     esac
+
+    selected_freesurfer_variant="$freesurfer_final"
+    if [[ -f "$work_dir/$preferred_aseg_name" ]]; then
+      final_aseg_name="$preferred_aseg_name"
+    elif [[ -f "$work_dir/$fallback_aseg_name" ]]; then
+      final_aseg_name="$fallback_aseg_name"
+      selected_freesurfer_variant="$fallback_variant"
+      log "Preferred FreeSurfer variant '$freesurfer_final' is unavailable; falling back to '$fallback_variant'"
+    else
+      echo "No postprocessed FreeSurfer aseg is available in $work_dir" >&2
+      exit 4
+    fi
 
     case "$synthseg_final" in
       raw_robust) final_synthseg_name="T1-ss1rrf.nii.gz" ;;
@@ -645,7 +795,7 @@ case "$stage" in
       enhanced_standard) final_synthseg_name="oT1e-ss2rrf.nii.gz" ;;
     esac
 
-    log "FreeSurfer source=$freesurfer_final file=$final_aseg_name"
+    log "FreeSurfer source=$selected_freesurfer_variant file=$final_aseg_name"
     log "SynthSeg source=$synthseg_final file=$final_synthseg_name"
 
     validate=(T1.nii.gz T1-skullstripped-tissue.nii.gz mask.nii.gz \
