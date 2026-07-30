@@ -3,7 +3,8 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Submit the full Medley workflow as subject-independent dependent SLURM arrays:
+Submit the full Medley workflow as subject-independent SLURM arrays
+with per-subject dependencies:
   iBEAT -> gather -> enhance/enlarge -> SynthSeg/two FreeSurfer variants/CHARM
   -> gather tool outputs -> inverse-scale/resample/register -> consolidation
 
@@ -11,7 +12,8 @@ Required:
   --raw-root DIR             Raw Baby Open Brains root with ses-1mo ... ses-8mo
   --work-root DIR            Working root that will contain AGE/sub-* folders
   --ibeat-sif FILE           iBEAT Singularity image
-  --fs-subjects-dir DIR      FreeSurfer SUBJECTS_DIR
+                             (required unless --skip-ibeat or --dry-run)
+  --fs-subjects-dir DIR      Root for variant-specific FreeSurfer output trees
   --scale-map FILE           Two-column file: AGE SCALE, e.g. 1m 1.33
 
 Usually needed:
@@ -23,7 +25,8 @@ Usually needed:
                              (default: WORK_PARENT/tool_outputs/synthseg)
   --charm-root DIR           Separate CHARM output root
                              (default: WORK_PARENT/tool_outputs/charm)
-  --simnibs-env-script FILE  Script to source before running charm
+  --simnibs-env-script FILE  Script to source before running CHARM
+                             (required unless --skip-charm)
   --conda-env NAME_OR_PATH   Conda environment name or full prefix path
                              (default: labelling)
   --conda-base DIR           Conda installation root containing etc/profile.d/conda.sh
@@ -47,7 +50,8 @@ Optional control:
                              (default: enhanced_enlarged)
   --skip-charm               Do not run or use CHARM whole-head labels
   --overwrite                Recompute/replace existing outputs
-  --dry-run                  Build manifest and print sbatch commands only
+  --dry-run                  Build the manifest/provenance and print sbatch
+                             commands without submitting jobs
   --run-dir DIR              Logs and manifest directory
   --final-name NAME          Default: medley_segmentation.nii.gz
   --email ADDRESS            SLURM mail address
@@ -355,9 +359,9 @@ dep_args() {
   if ((${#ids[@]})); then
     local joined
     joined="$(IFS=:; echo "${ids[*]}")"
-    # All Medley stages are arrays over the same manifest. aftercorr makes
-    # task N wait only for task N of each upstream array, so a failure for one
-    # subject cannot block unrelated subjects.
+    # All stages use arrays over the same manifest. aftercorr makes downstream
+    # task N depend only on task N of each upstream array. Therefore, failure of
+    # one subject blocks only that subject's downstream tasks.
     printf '%s\n' "--dependency=aftercorr:$joined"
   fi
 }
@@ -423,9 +427,10 @@ if [[ "$skip_charm" != "1" ]]; then
   tool_jobs+=("$charm_job")
 fi
 
-# If one or more tools are being reused, gather_tools validates their existing outputs.
-# Each gather task waits only for the corresponding subject task from every tool
-# submitted in this run. A missing/failing subject does not block other subjects.
+# Gather and validate tool outputs produced in this run or reused from
+# previous runs. Each task waits only for the corresponding subject task
+# from every tool submitted in this run, so one subject failure does not
+# block unrelated subject tasks.
 gather_tools_dependencies=("$preprocess_job" "${tool_jobs[@]}")
 gather_tools_job="$(submit gather_tools "${common[@]}" "$(dep_args "${gather_tools_dependencies[@]}")" \
   --partition="$cpu_partition" --cpus-per-task=1 --mem=12G \
