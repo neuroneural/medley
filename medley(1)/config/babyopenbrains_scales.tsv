@@ -1,0 +1,10 @@
+# Age-dependent enlargement factors used for Baby Open Brains.
+# Values are the Applied z factors from Table S3.
+1m	1.25
+2m	1.20
+3m	1.16
+4m	1.16
+5m	1.14
+6m	1.11
+7m	1.09
+8m	1.07

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use Medley, please cite the associated manuscript and this software."
+title: "Medley: An Anatomy-Aware Multi-Tool Curation Method for Infant Brain MRI Segmentation"
+type: software
+version: 1.0.0
+authors:
+  - family-names: "Le"
+    given-names: "Isabelle A. T."
+  - family-names: "Bachevalier"
+    given-names: "Jocelyne"
+  - family-names: "Shultz"
+    given-names: "Sarah R."
+  - family-names: "Calhoun"
+    given-names: "Vince D."
+  - family-names: "Plis"
+    given-names: "Sergey M."
+repository-code: "https://github.com/neuroneural/medley"
