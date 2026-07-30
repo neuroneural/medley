@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Submit the full Medley workflow as dependent SLURM arrays:
+Submit the full Medley workflow as subject-independent dependent SLURM arrays:
   iBEAT -> gather -> enhance/enlarge -> SynthSeg/two FreeSurfer variants/CHARM
   -> gather tool outputs -> inverse-scale/resample/register -> consolidation
 
@@ -40,9 +40,10 @@ Optional control:
   --ages SPEC                Default: 1-8; accepts 1-4,6,8
   --skip-ibeat               Reuse existing iBEAT outputs
   --skip-synthseg            Reuse existing SynthSeg output folders
-  --skip-freesurfer          Reuse both existing FreeSurfer variant outputs
-  --freesurfer-final MODE    FreeSurfer aseg passed to final consolidation:
+  --skip-freesurfer          Do not run FreeSurfer; reuse at least one existing variant
+  --freesurfer-final MODE    Preferred FreeSurfer aseg for final consolidation:
                              enhanced or enhanced_enlarged
+                             automatically falls back if unavailable
                              (default: enhanced_enlarged)
   --skip-charm               Do not run or use CHARM whole-head labels
   --overwrite                Recompute/replace existing outputs
@@ -318,7 +319,8 @@ mail_args=()
 if [[ -n "$email" ]]; then
   mail_args=(--mail-user="$email" --mail-type=FAIL,END)
 fi
-common=(--account="$account" --nodes=1 --ntasks=1 --time=20:00:00 "${mail_args[@]}")
+common=(--account="$account" --nodes=1 --ntasks=1 --time=20:00:00 \
+  --kill-on-invalid-dep=yes "${mail_args[@]}")
 log_pattern="$run_dir/logs/%x-%A_%a.out"
 err_pattern="$run_dir/logs/%x-%A_%a.err"
 worker="$code_dir/medley_worker.sh"
@@ -353,7 +355,10 @@ dep_args() {
   if ((${#ids[@]})); then
     local joined
     joined="$(IFS=:; echo "${ids[*]}")"
-    printf '%s\n' "--dependency=afterok:$joined"
+    # All Medley stages are arrays over the same manifest. aftercorr makes
+    # task N wait only for task N of each upstream array, so a failure for one
+    # subject cannot block unrelated subjects.
+    printf '%s\n' "--dependency=aftercorr:$joined"
   fi
 }
 
@@ -419,7 +424,8 @@ if [[ "$skip_charm" != "1" ]]; then
 fi
 
 # If one or more tools are being reused, gather_tools validates their existing outputs.
-# It still waits for every tool that was submitted in this run.
+# Each gather task waits only for the corresponding subject task from every tool
+# submitted in this run. A missing/failing subject does not block other subjects.
 gather_tools_dependencies=("$preprocess_job" "${tool_jobs[@]}")
 gather_tools_job="$(submit gather_tools "${common[@]}" "$(dep_args "${gather_tools_dependencies[@]}")" \
   --partition="$cpu_partition" --cpus-per-task=1 --mem=12G \
@@ -447,7 +453,7 @@ Working root:        $work_root
 iBEAT output root:   $ibeat_output_root
 SynthSeg output root:$synthseg_root
 FreeSurfer root:     $fs_subjects_dir
-FreeSurfer final:    $freesurfer_final
+FreeSurfer preferred:$freesurfer_final
 SynthSeg final:      $synthseg_final
 CHARM output root:   $charm_root
 SimNIBS activation:  $simnibs_env_script
